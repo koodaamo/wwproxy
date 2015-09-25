@@ -105,23 +105,18 @@ class WAMPClient(ApplicationSession):
 
    @inlineCallbacks
    def onConnect(self):
-      self.logger.info("CONNECTED")
+      self.logger.info("proxy WAMP client connected to router")
       self.join("realm1")
       yield self.lookupProcedures()
       yield self.lookupSubscriptions()
 
    def onJoin(self, details):
-      if not getattr(self.factory, "_appSession", None):
+      if not getattr(self.factory, "_session", None):
          self.factory._session = self # set the session instance
 
    def onLeave(self, details):
       if getattr(self.factory, "_appSession", None) == self:
          self.factory._appSession = None
-
-      slist = yield self.call("wamp.subscription.list")
-      self.logger.info("SUBSCRIPTIONS: %s" % str(slist))
-      rlist = yield self.call("wamp.registration.list")
-      self.logger.info("REGISTRATIONS: %s" % str(rlist))
 
 
 #
