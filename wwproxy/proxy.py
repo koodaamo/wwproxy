@@ -5,6 +5,7 @@ from twisted.application import service
 from twisted.logger import Logger, globalLogPublisher, textFileLogObserver
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
+from twisted.internet import defer
 from twisted.internet.endpoints import clientFromString
 from autobahn.twisted.wamp import ApplicationSessionFactory, ApplicationSession
 from autobahn.twisted.websocket import WebSocketServerProtocol, \
@@ -12,7 +13,7 @@ from autobahn.twisted.websocket import WebSocketServerProtocol, \
                                        WampWebSocketClientFactory
 from autobahn.wamp.exception import ApplicationError
 
-globalLogPublisher.addObserver(textFileLogObserver(sys.stdout))
+#globalLogPublisher.addObserver(textFileLogObserver(sys.stdout))
 
 PUBSUB = "pubsub"
 RPC = "rpc"
@@ -29,6 +30,7 @@ class WSServer(WebSocketServerProtocol):
 
    def onConnect(self, request):
       self.logger.info("Client connecting: {0}".format(request.peer))
+      self.wamp_session = self.factory.wamp_session_factory._session # live session
 
    def onOpen(self):
       self.logger.info("WebSocket connection open.")
@@ -53,20 +55,21 @@ class WSServer(WebSocketServerProtocol):
       parsed = self.parseWSMessageFormat(message)
       if parsed:
          kind, opid, payload = parsed
-         if kind=="rpc" and opid=="vidamin.services.tele.sms.send":
+         if kind=="rpc" and opid in self.wamp_session._registrations:
             try:
                recipient, message = payload.split('|')
             except:
                pass
             else:
-               call = self.factory.wamp_session_factory._session.call # the live session
                try:
-                  yield call("vidamin.services.tele.sms.send", recipient, message)
-               except ApplicationError:
-                  pass
+                  yield self.wamp_session.call(opid, recipient, message)
+               except ApplicationError as exc:
+                  self.logger.warn("WAMP request failed: %s" % str(exc))
                else:
                   self.sendMessage("OK".encode("utf-8"), False)
                   return
+      elif kind == "pubsub" and opid in self.wamp_session._subscriptions:
+         pass
 
       # otherwise, fail
       self.sendMessage("FAIL".encode("utf-8"), False)
@@ -82,19 +85,30 @@ class WAMPClient(ApplicationSession):
 
    @inlineCallbacks
    def lookupSubscriptions(self):
-      slist = yield self.call("wamp.subscription.list")
-      yield [s["exact"] for s in slist]
+      subsdata = yield self.call("wamp.subscription.list")
+      sids = [id for id in subsdata["exact"]]
+      self._subscriptions = []
+      for sid in sids:
+         subscription = yield self.call("wamp.subscription.get", sid)
+         self._subscriptions.append(subscription["uri"])
+         self.logger.info("discovered PubSub subscription: " + str(subscription))
 
    @inlineCallbacks
    def lookupProcedures(self):
-      rlist = yield self.call("wamp.registration.list")
-      yield [r["exact"] for r in rlist]
+      regsdata = yield self.call("wamp.registration.list")
+      rids = [id for id in regsdata["exact"]]
+      self._registrations = []
+      for rid in rids:
+         registration = yield self.call("wamp.registration.get", rid)
+         self._registrations.append(registration["uri"])
+         self.logger.info("discovered RPC registration: " + registration["uri"])
 
+   @inlineCallbacks
    def onConnect(self):
       self.logger.info("CONNECTED")
       self.join("realm1")
-      self.logger.info(', '.join(self.lookupProcedures()))
-      self.logger.info(', '.join(self.lookupSubscriptions()))
+      yield self.lookupProcedures()
+      yield self.lookupSubscriptions()
 
    def onJoin(self, details):
       if not getattr(self.factory, "_appSession", None):
@@ -130,15 +144,16 @@ class WebSocketListenerService(service.Service):
       self.factory.protocol = WSServer
       self.factory.setProtocolOptions(maxConnections=10)
 
-
    def startService(self):
       wampservice = self.parent.getServiceNamed("WAMPClient")
       self.factory.wamp_session_factory = wampservice.session_factory
       self.listener = reactor.listenTCP(self.port, self.factory, interface=self.address)
+      self.logger.info("service started")
 
    def stopService(self):
       self.listener.stopListening()
       self.factory.stopFactory()
+      self.logger.info("service stopped")
 
 
 class WAMPClientService(service.Service):
@@ -160,11 +175,13 @@ class WAMPClientService(service.Service):
    def startService(self):
       self.client = clientFromString(reactor, "tcp:%s:%i" % (self.address, self.port))
       self.client.connect(self.transport_factory)
+      self.logger.info("service started")
 
    def stopService(self):
       self.client.disconnect()
       self.session_factory.stopFactory()
       self.transport_factory.stopFactory()
+      self.logger.info("service stopped")
 
 
 
