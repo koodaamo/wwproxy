@@ -17,7 +17,8 @@ Default connection strings:
 
 To make WAMP requests over Websocket, use the following message notation:
 
-* rpc:identifier:payload
+* realm:rpc:identifier:payload
 
-* pubsub:identifier:payload
+* realm:pubsub:identifier:payload
 
+Where payload is a JSON object with {args:[], kwargs:{}} stanza.
