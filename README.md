@@ -21,4 +21,4 @@ To make WAMP requests over Websocket, use the following message notation:
 
 * realm:pubsub:identifier:payload
 
-Where payload is a JSON object with {args:[], kwargs:{}} stanza.
+Where payload is a JSON object that has a {args:[], kwargs:{}} stanza.
