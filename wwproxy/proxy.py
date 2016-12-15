@@ -1,22 +1,58 @@
-import sys, json
+import os
+import json
 from urlparse import urlparse
-import pkg_resources
 from twisted.application import service
-from twisted.logger import Logger, globalLogPublisher, textFileLogObserver
-from twisted.internet import reactor, defer
+from twisted.logger import Logger
+from twisted.internet import reactor, defer, ssl
+from twisted.internet.protocol import ReconnectingClientFactory
 from twisted.internet.defer import inlineCallbacks
 from twisted.internet.endpoints import clientFromString
+from autobahn.twisted import websocket
 from autobahn.twisted.wamp import ApplicationSession
 from autobahn.twisted.websocket import WebSocketServerProtocol, \
                                        WebSocketServerFactory, \
                                        WampWebSocketClientFactory
 from autobahn.wamp.exception import ApplicationError
 
-#globalLogPublisher.addObserver(textFileLogObserver(sys.stdout))
 
-PUBSUB = "pubsub"
-RPC = "rpc"
-MSGSEP = ':'
+#
+# SSL/TLS context factory for client certificate auth
+#
+
+class ClientContextFactory(ssl.ClientContextFactory):
+
+   def __init__(self, key_path, crt_path):
+      if not (os.path.isfile(key_path) and os.path.isfile(crt_path)):
+         raise Exception("key or certificate file not found, cannot proceed!")
+      self.key_path = key_path
+      self.crt_path = crt_path
+
+   def getContext(self):
+      #self.method = SSL.SSLv23_METHOD
+      ctx = ssl.ClientContextFactory.getContext(self)
+      ctx.use_privatekey_file(self.key_path)
+      ctx.use_certificate_file(self.crt_path)
+      return ctx
+
+
+#
+# Reconnecting transport factory
+#
+
+class WAMPClientFactory(WampWebSocketClientFactory, ReconnectingClientFactory):
+
+   logger = Logger()
+
+   maxDelay = 3
+
+   def clientConnectionFailed(self, connector, reason):
+      self.logger.warn("connection failed: %s" % reason)
+      ReconnectingClientFactory.clientConnectionFailed(self, connector, reason)
+
+   def clientConnectionLost(self, connector, reason):
+      self.logger.warn("connection lost: %s" % reason)
+      ReconnectingClientFactory.clientConnectionLost(self, connector, reason)
+
 
 #
 # PROTOCOL
@@ -30,53 +66,49 @@ class WSServer(WebSocketServerProtocol):
    wamp_clients = {}
 
    def onConnect(self, request):
-      self.logger.info("client connecting: {0}".format(request.peer))
+      self.logger.debug("client connecting: {0}".format(request.peer))
 
    def onOpen(self):
-      self.logger.info("WebSocket connection open.")
+      self.logger.debug("WebSocket connection open.")
 
 
-   def parseWSMessageFormat(self, message):
-      try:
-         parts = message.decode("UTF-8").split(MSGSEP)
-      except:
-         return None
-      else:
-         # return (realm, rpc/pubsub, opid, args+kwargs)
-         argskwargs = message[(len(parts[0]) + len(parts[1]) + len(parts[2]) + 3):]
-         return (parts[0], parts[1], parts[2], argskwargs)
-
+   def sendJSONMessage(self, status, response):
+      "convenience for responding back to 'plain' websocket client"
+      self.sendMessage(json.dumps((status, response)), False)
 
    @inlineCallbacks
-   def proxy_message(self, client, kind, opid, argdata):
+   def proxy_message(self, client, realm=None, method=None, event=None, args=None, kwargs=None):
       "deliver the received message, converted to WAMP"
 
-      if kind == RPC and opid in client._registrations:
+      if method: # RPC
+
          try:
-            # args+kwargs is a (optional) JSON structure
-            if argdata:
-               params = json.loads(argdata)
-               args = params.get("args") or []
-               kwargs = params.get("kwargs") or {}
-            else:
-               args, kwargs = [], {}
-         except:
-            self.sendMessage("FAIL could not parse args/kwargs".encode("utf-8"), False)
+            # make the outgoing WAMP call
+            response = yield client.call(method, *args, **kwargs)
+         except ApplicationError as exc:
+            self.logger.error("WAMP request failed: %s" % exc.error_message())
+            self.sendJSONMessage(501, "wamp request failed")
             return
          else:
-            try:
-               response = yield client.call(opid, *args, **kwargs)
-            except ApplicationError as exc:
-               self.logger.warn("WAMP request failed: %s" % str(exc))
-               self.sendMessage("FAIL wamp request failed".encode("utf-8"), False)
-               return
-            else:
-               self.sendMessage(json.dumps(response), False)
-               return
-      elif kind == PUBSUB and opid in client._subscriptions:
-         self.sendMessage("FAIL pubsub not yet supported".encode("utf-8"), False)
+            self.logger.debug(type(response))
+            self.logger.debug(str(response))
+            self.sendJSONMessage(200, response)
+            return
+
+      elif event: # PUBSUB
+         if event not in client._subscriptions:
+            self.sendJSONMessage(400, u"event '%s' not subscribed by anyone" % event)
+            self.logger.warn("event '%s' published by client is not subscribed by anyone" % event)
+            return
+
+         self.logger.warn("pubsub not yet supported")
+
+         self.sendJSONMessage(501, u"pubsub not yet supported")
+         return
+
       else:
-         self.sendMessage("FAIL unknown semantics; use 'rpc' or 'pubsub'".encode("utf-8"), False)
+         self.logger.warn("client did not specify request type")
+         self.sendJSONMessage(400, u"no request type given")
 
 
    def get_wamp_client(self, realm):
@@ -85,7 +117,7 @@ class WSServer(WebSocketServerProtocol):
          self.logger.debug("using existing client for realm '%s'" % realm)
          return defer.succeed(self.wamp_clients[realm])
       else:
-         self.logger.debug("requesting new client for realm '%s'" % realm)
+         self.logger.debug("connecting new client for realm '%s'" % realm)
          d = defer.Deferred()
 
          def factory():
@@ -95,29 +127,57 @@ class WSServer(WebSocketServerProtocol):
             self.wamp_clients[realm] = client
             return client
 
-         wamp_transport_factory = WampWebSocketClientFactory(factory, self.service.r_uri)
+         wamp_transport_factory = WAMPClientFactory(factory, self.service.r_uri)
          addr, port = self.service.r_address, self.service.r_port
-         client = clientFromString(reactor, "tcp:%s:%i" % (addr, port))
-         client.connect(wamp_transport_factory)
+         #client = clientFromString(reactor, "tcp:%s:%i" % (addr, port))
+         #client.connect(wamp_transport_factory)
+         wamp_transport_factory.host = addr
+         wamp_transport_factory.port = port
+
+         if wamp_transport_factory.isSecure:
+            self.logger.info("securing connection using TLS")
+            key, crt = self.service.client_key, self.service.client_crt
+            if key and crt:
+               self.logger.info("using client certificate authentication")
+               self.logger.info("key: %s" % key)
+               self.logger.info("certificate: %s" % crt)
+               contextFactory = ClientContextFactory(key, crt)
+            else:
+               # use default (no client certificate auth)
+               contextFactory = ssl.ClientContextFactory()
+
+         else:
+            contextFactory = None
+            self.logger.warn("insecure operation; recommend switching to TLS")
+
+         websocket.connectWS(wamp_transport_factory, contextFactory)
          return d
 
 
    @inlineCallbacks
    def onMessage(self, message, isBinary):
+      "upon websocket message, parse it, get client for the realm and make the call"
 
       if isBinary:
          raise Exception("cannot handle binary messages")
-      self.logger.debug("received msg: {0}".format(message.decode('utf8')))
 
-      parsed = self.parseWSMessageFormat(message)
+      self.logger.debug("received request: {0}".format(message.decode('utf8')))
 
-      if not parsed:
-         self.sendMessage("FAIL could not parse message at all".encode("utf-8"), False)
+      try:
+         parsed = json.loads(message)
+      except:
+         self.logger.warn("could not parse client request to JSON")
+         self.sendJSONMessage(400, u"parsing request to JSON failed")
          return
 
-      realm, kind, opid, argdata = parsed
+         if not parsed.get("realm"):
+            self.logger.warn("client did not specify realm")
+            self.sendJSONMessage(400, u"realm not specified, please specify")
 
-      self.get_wamp_client(realm).addCallback(self.proxy_message, kind, opid, argdata)
+            return
+
+      # get a connected WAMP client and register message delivery upon connect
+      self.get_wamp_client(parsed["realm"]).addCallback(self.proxy_message, **parsed)
       yield
 
 
@@ -137,7 +197,7 @@ class WAMPClient(ApplicationSession):
       for sid in sids:
          subscription = yield self.call("wamp.subscription.get", sid)
          self._subscriptions.append(subscription["uri"])
-         self.logger.info("discovered PubSub subscription: " + str(subscription))
+         self.logger.debug("discovered PubSub subscription: " + str(subscription))
 
    @inlineCallbacks
    def lookupProcedures(self):
@@ -147,16 +207,16 @@ class WAMPClient(ApplicationSession):
       for rid in rids:
          registration = yield self.call("wamp.registration.get", rid)
          self._registrations.append(registration["uri"])
-         self.logger.info("discovered RPC registration: " + registration["uri"])
+         self.logger.debug("discovered RPC registration: " + registration["uri"])
 
    @inlineCallbacks
    def onConnect(self):
       self.logger.info("proxy WAMP client connected to router")
-      yield self.join(self._realm)
+      yield self.join(self._realm, authmethods=[u"tls"])
 
 
    def onJoin(self, details):
-      self.logger.info("proxy WAMP client joined realm")
+      self.logger.info("proxy WAMP client joined realm: %s" % details)
 
       def release(_):
          self._on_join.callback(self)
@@ -179,7 +239,7 @@ class WebSocketListenerService(service.Service):
 
    logger = Logger()
 
-   def __init__(self, server_uri, router_uri, debug=False):
+   def __init__(self, server_uri, router_uri, client_key, client_crt, debug=False):
       self.s_uri = server_uri
       self.s_address = urlparse(server_uri).hostname
       self.s_port = urlparse(server_uri).port
@@ -188,13 +248,16 @@ class WebSocketListenerService(service.Service):
       self.r_address = urlparse(router_uri).hostname
       self.r_port = urlparse(router_uri).port
 
+      self.client_key = client_key
+      self.client_crt = client_crt
+
       self.debug = debug
 
       self.s_factory = WebSocketServerFactory(server_uri)
       proto = WSServer
       proto.service = self
       self.s_factory.protocol = proto
-      self.s_factory.setProtocolOptions(maxConnections=10)
+      self.s_factory.setProtocolOptions(maxConnections=40)
 
    def startService(self):
       self.s_listener = reactor.listenTCP(self.s_port, self.s_factory, interface=self.s_address)
