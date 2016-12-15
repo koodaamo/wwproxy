@@ -19,6 +19,7 @@ setup(name='wwproxy',
       zip_safe=False,
       install_requires=[
          "twisted",
+         "pyopenssl",
          "setproctitle",
          "autobahn"
       ],
