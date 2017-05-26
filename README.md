@@ -10,6 +10,8 @@ To start the proxy, run:
 
 (or use `twistd` to run in the background)
 
+Pass '--help' as a parameter for command-line options.
+
 Default connection strings:
 
 * websocket server: ws://127.0.0.1:9000/ws
