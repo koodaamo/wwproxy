@@ -1,8 +1,8 @@
 # wwproxy
 
-Twisted WebSocket to WAMP proxy
+This is a [Twisted](https://twistedmatrix.com) WebSocket to [WAMP](https://wamp-proto.org) proxy.
 
-Make WAMP calls without supporting the WAMP protocol.
+Running your own wwproxy makes it possible to make WAMP calls without supporting the WAMP protocol.
 
 To start the proxy, run:
 
@@ -19,7 +19,7 @@ Default connection strings:
 * WAMP router: ws://127.0.0.1:8080/ws
 
 The following message structures are used for conveying (WAMP) RPC and PubSub semantics,
-using JSON-encoded messages. Some inspiration has been taken from JSON-RPC (http://www.jsonrpc.org).
+using JSON-encoded messages. Some inspiration has been taken from [JSON-RPC](http://www.jsonrpc.org).
 
 For a RPC request, use the following structure:
 
