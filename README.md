@@ -2,7 +2,7 @@
 
 This is a [Twisted](https://twistedmatrix.com) WebSocket to [WAMP](https://wamp-proto.org) proxy.
 
-Running your own wwproxy makes it possible to make WAMP calls without supporting the WAMP protocol.
+Running your own wwproxy makes it possible to make WAMP calls without supporting the WAMP protocol, instead simply by passing a JSON payload in a HTTP POST.
 
 To start the proxy, run:
 
